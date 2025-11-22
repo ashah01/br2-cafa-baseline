@@ -1,39 +1,26 @@
 """Baseline CAFA evaluation pipeline for the GCN stacker model.
 
-This script mirrors the high-level workflow of evals/cafa_evals.py but
-runs inference with the protein baseline defined in protnn/scripts/train_gcn.py
-and evaluates the resulting predictions with the cafaeval package.
+This version expects predictions produced by protnn/scripts/predict_gcn.py
+and aggregated in the same fashion as protlib/scripts/postproc/collect_ttas.py.
+It then evaluates those predictions with the cafaeval package while loading
+ground-truth labels from the stacker's temp directories (mirroring the
+post-processing scripts).
 """
 import argparse
 import json
-import os
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
-import joblib
 import numpy as np
 import pandas as pd
-import torch
 import yaml
 from cafaeval.evaluation import cafa_eval
 from colorama import Fore, Style, init
 
-from protnn.dataset import StackDataLoader, StackDataset
-from protnn.stacker import GCNStacker
-from protnn.utils import get_goa_data, make_submission
-from protlib.metric import Graph, get_topk_targets, ia_parser, obo_parser
-
-NAMESPACE_TO_KEY = {
-    "biological_process": "bp",
-    "molecular_function": "mf",
-    "cellular_component": "cc",
-}
-ONTOLOGY_INDEX = {"bp": 0, "mf": 1, "cc": 2}
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate the GCN protein baseline on CAFA ground truth."
+        description="Evaluate precomputed GCN stacker predictions on CAFA ground truth."
     )
     parser.add_argument(
         "--config",
@@ -41,47 +28,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to the YAML config used for training (e.g. config.yaml)",
     )
     parser.add_argument(
-        "--device",
-        default="0",
-        help="CUDA device index (default: 0).",
-    )
-    parser.add_argument(
-        "--checkpoint_name",
-        default="checkpoint.pth",
-        help=(
-            "Checkpoint filename inside models/gcn/<ontology>/ (default: checkpoint.pth)."
-        ),
-    )
-    parser.add_argument(
         "--ontologies",
         nargs="+",
         default=["bp", "mf", "cc"],
         choices=["bp", "mf", "cc"],
         help="Which ontologies to evaluate (default: all).",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=128,
-        help="Batch size for the evaluation dataloader (default: 128).",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=8,
-        help="Number of workers for the dataloader (default: 8).",
-    )
-    parser.add_argument(
-        "--topk",
-        type=int,
-        default=500,
-        help="Top-K predictions to retain per protein when writing submissions (default: 500).",
-    )
-    parser.add_argument(
-        "--tau",
-        type=float,
-        default=0.01,
-        help="Minimum probability threshold for predictions (default: 0.01).",
     )
     parser.add_argument(
         "--threads",
@@ -100,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         default=0.01,
         help="Threshold step passed to cafaeval (default: 0.01).",
     )
+    parser.add_argument(
+        "--tta_count",
+        type=int,
+        help="Override the number of TTA prediction files to aggregate. Defaults to the config value.",
+    )
     return parser.parse_args()
 
 
@@ -108,46 +64,72 @@ def load_config(path: str) -> Dict:
         return yaml.safe_load(handle)
 
 
-def load_graphs(graph_path: Path, ia_path: Path) -> Dict[str, Graph]:
-    ia_dict = ia_parser(str(ia_path))
-    graphs: Dict[str, Graph] = {}
-    for namespace, terms_dict in obo_parser(str(graph_path)).items():
-        key = NAMESPACE_TO_KEY.get(namespace)
-        if key is None:
-            continue
-        graphs[key] = Graph(namespace, terms_dict, ia_dict, True)
-    return graphs
+def collect_tta_predictions(models_root: Path, tta_count: int) -> pd.DataFrame:
+    """Aggregate TTA submission files into a single prediction dataframe."""
+    if tta_count <= 0:
+        raise ValueError("tta_count must be positive to collect predictions")
+
+    prediction_files = []
+    for idx in range(tta_count):
+        path = models_root / "gcn" / f"pred_tta_{idx}.tsv"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing TTA prediction file {path}. Run predict_gcn.py before evaluation."
+            )
+        df = pd.read_csv(path, sep="\t", header=None, names=["EntryID", "term", f"prob{idx}"])
+        prediction_files.append(df)
+
+    combined = prediction_files[0]
+    for df in prediction_files[1:]:
+        combined = combined.merge(df, how="outer", on=["EntryID", "term"]).fillna(0)
+
+    prob_cols = [f"prob{idx}" for idx in range(tta_count)]
+    combined["prob"] = combined[prob_cols].mean(axis=1)
+    return combined[["EntryID", "term", "prob"]]
 
 
-def load_test_labels(temporal_path: Path) -> pd.DataFrame:
-    label_files = [
-        temporal_path / "labels" / "prop_test_leak_no_dup.tsv",
-        temporal_path / "labels" / "prop_quickgo51.tsv",
-    ]
-    frames = []
-    for file in label_files:
-        if not file.exists():
-            raise FileNotFoundError(f"Missing label file: {file}")
-        frames.append(pd.read_csv(file, sep="\t"))
-    labels = pd.concat(frames).drop_duplicates().reset_index(drop=True)
+def infer_tta_count(config: Dict, ontologies: Sequence[str]) -> int:
+    """Determine how many TTA submissions were generated from the config."""
+
+    for ontology in ontologies:
+        ontology_cfg = config.get("gcn", {}).get(ontology)
+        if ontology_cfg and ontology_cfg.get("tta"):
+            return len(ontology_cfg["tta"])
+
+    for ontology_cfg in config.get("gcn", {}).values():
+        if ontology_cfg.get("tta"):
+            return len(ontology_cfg["tta"])
+
+    raise ValueError(
+        "Could not infer TTA count from config. Ensure gcn.<ontology>.tta is defined."
+    )
+
+
+def load_labels_from_temp(models_root: Path, ontologies: Sequence[str]) -> pd.DataFrame:
+    """Load ground-truth labels from the GCN temp folders (train_gcn output)."""
+
+    label_frames: List[pd.DataFrame] = []
+    searched_paths: List[Path] = []
+    for ontology in ontologies:
+        candidate = models_root / "gcn" / ontology / "temp" / "labels.tsv"
+        searched_paths.append(candidate)
+        if candidate.exists():
+            df = pd.read_csv(candidate, sep="\t")
+            if not {"EntryID", "term"}.issubset(df.columns):
+                raise ValueError(
+                    f"Label file {candidate} is missing required columns EntryID and term."
+                )
+            label_frames.append(df[["EntryID", "term"]])
+
+    if not label_frames:
+        joined = "\n".join(str(path) for path in searched_paths)
+        raise FileNotFoundError(
+            "Could not find labels.tsv in any ontology temp directory. "
+            "Ensure train_gcn.py has been run. Checked:\n" + joined
+        )
+
+    labels = pd.concat(label_frames).drop_duplicates().reset_index(drop=True)
     return labels
-
-
-def align_entry_ids(helpers_path: Path, entry_ids: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
-    seq_path = helpers_path / "fasta" / "test_seq.feather"
-    if not seq_path.exists():
-        raise FileNotFoundError(f"Missing FASTA metadata: {seq_path}")
-    seq_df = pd.read_feather(seq_path, columns=["EntryID"]).reset_index().set_index("EntryID")
-    try:
-        subset = seq_df.loc[entry_ids]
-    except KeyError as exc:  # provide explicit context on missing IDs
-        missing = set(entry_ids) - set(seq_df.index)
-        raise KeyError(
-            f"Could not locate {len(missing)} EntryID values in {seq_path}: {sorted(missing)[:5]}"
-        ) from exc
-    ordered_ids = subset.index.to_numpy()
-    positional_index = subset["index"].to_numpy().astype(int)
-    return ordered_ids, positional_index
 
 
 def write_ground_truth(labels: pd.DataFrame, output_path: Path) -> None:
@@ -155,156 +137,6 @@ def write_ground_truth(labels: pd.DataFrame, output_path: Path) -> None:
     with open(output_path, "w") as handle:
         for entry_id, term in labels[["EntryID", "term"]].itertuples(index=False):
             handle.write(f"{entry_id}\t{term}\n")
-
-
-def build_prediction_sources(
-    config: Dict,
-    nn_cfg: Dict,
-    ontology_key: str,
-    graph: Graph,
-    models_root: Path,
-    helpers_path: Path,
-    temporal_path: Path,
-    positional_index: np.ndarray,
-    ordered_ids: np.ndarray,
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, bool]], List, np.ndarray, np.ndarray, List[List[int]]]:
-    nout = ONTOLOGY_INDEX[ontology_key]
-
-    models_config = []
-    for model_name in nn_cfg["preds"]:
-        base_cfg = config["base_models"][model_name]
-        models_config.append(
-            (
-                models_root / model_name,
-                [base_cfg["bp"], base_cfg["mf"], base_cfg["cc"]],
-                base_cfg["conditional"],
-            )
-        )
-
-    preds: List[Tuple[np.ndarray, np.ndarray, bool]] = []
-    idx_lookup: List[List[int]] = []
-    for folder, split, conditional in models_config:
-        pred_path = folder / "test_pred.pkl"
-        if not pred_path.exists():
-            raise FileNotFoundError(f"Missing base prediction file: {pred_path}")
-        raw_pred = joblib.load(pred_path)
-        # select proteins in the order expected by the model
-        raw_pred = raw_pred[positional_index]
-        start = sum(split[:nout])
-        stop = start + split[nout]
-        slice_pred = raw_pred[:, start:stop]
-        idx = get_topk_targets(graph, split[nout], train_path=str(Path(config["base_path"]) / "Train"))
-        preds.append((slice_pred, idx, conditional))
-        idx_lookup.append(idx)
-
-    for side_name in nn_cfg.get("side_preds", []):
-        public_cfg = config["public_models"][side_name]
-        side_path = models_root / side_name / public_cfg["source"]
-        if not side_path.exists():
-            raise FileNotFoundError(f"Missing side prediction file: {side_path}")
-        side_pred = joblib.load(side_path)
-        split = side_pred["borders"]
-        start = sum(split[:nout])
-        stop = start + split[nout]
-        arr = side_pred["test_pred"][positional_index][:, start:stop]
-        idx = side_pred["idx"][start:stop]
-        preds.append((arr, idx, False))
-        idx_lookup.append(idx)
-
-    prior_cnd = joblib.load(helpers_path / f"real_targets/{graph.namespace}/prior.pkl")
-    nulls = joblib.load(helpers_path / f"real_targets/{graph.namespace}/nulls.pkl")
-    prior_raw = prior_cnd * (1 - nulls)
-
-    goa_data = get_goa_data(str(temporal_path), "test", ordered_ids, graph)
-    return preds, goa_data, prior_raw, prior_cnd, idx_lookup
-
-
-def build_dataloader(
-    preds: List[Tuple[np.ndarray, np.ndarray, bool]],
-    goa_data: List[pd.Series],
-    prior_raw: np.ndarray,
-    prior_cnd: np.ndarray,
-    graph: Graph,
-    batch_size: int,
-    num_workers: int,
-) -> StackDataLoader:
-    dataset = StackDataset(
-        preds,
-        graph.idxs,
-        prior_raw,
-        prior_cnd,
-        graph,
-        goa_list=goa_data,
-        p_goa=1,
-        targets=None,
-    )
-    return StackDataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-
-def run_inference_for_ontology(
-    ontology: str,
-    config: Dict,
-    nn_cfg: Dict,
-    graph: Graph,
-    models_root: Path,
-    helpers_path: Path,
-    temporal_path: Path,
-    positional_index: np.ndarray,
-    ordered_ids: np.ndarray,
-    checkpoint_name: str,
-    batch_size: int,
-    num_workers: int,
-    predictions_path: Path,
-    mode: str,
-    topk: int,
-    tau: float,
-) -> None:
-    preds, goa_data, prior_raw, prior_cnd, _ = build_prediction_sources(
-        config,
-        nn_cfg,
-        ontology,
-        graph,
-        models_root,
-        helpers_path,
-        temporal_path,
-        positional_index,
-        ordered_ids,
-    )
-
-    dataloader = build_dataloader(
-        preds,
-        goa_data,
-        prior_raw,
-        prior_cnd,
-        graph,
-        batch_size,
-        num_workers,
-    )
-
-    model = GCNStacker(
-        len(preds),
-        len(goa_data),
-        graph.idxs,
-        hidden_size=nn_cfg["hidden_size"],
-        n_layers=nn_cfg["n_layers"],
-        embed_size=nn_cfg["embed_size"],
-    )
-    checkpoint_path = models_root / "gcn" / ontology / checkpoint_name
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
-    model = model.cuda()
-    make_submission(
-        model,
-        dataloader,
-        graph,
-        ordered_ids,
-        str(predictions_path),
-        mode=mode,
-        topk=topk,
-        tau=tau,
-    )
 
 
 def run_cafa_evaluation(
@@ -381,14 +213,9 @@ def main():
     init()
     args = parse_args()
 
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
-
     config = load_config(args.config)
     base_path = Path(config["base_path"]).resolve()
     models_root = base_path / config["models_path"]
-    helpers_path = base_path / config["helpers_path"]
-    temporal_path = base_path / config["temporal_path"]
     ontology_path = base_path / "Train" / "go-basic.obo"
     ia_file_path = base_path / "IA.txt"
 
@@ -397,42 +224,15 @@ def main():
     predictions_dir.mkdir(parents=True, exist_ok=True)
     predictions_file = predictions_dir / "baseline_predictions.tsv"
 
-    labels = load_test_labels(temporal_path)
-    ordered_ids, positional_index = align_entry_ids(
-        helpers_path, labels["EntryID"].drop_duplicates().values
-    )
+    tta_count = args.tta_count or infer_tta_count(config, args.ontologies)
+    print(f"{Fore.CYAN}Aggregating {tta_count} TTA prediction files...{Style.RESET_ALL}")
+    predictions = collect_tta_predictions(models_root, tta_count)
+    predictions.to_csv(predictions_file, sep="\t", header=False, index=False)
+
+    print(f"{Fore.CYAN}Loading ground truth labels from stacker temp directories...{Style.RESET_ALL}")
+    labels = load_labels_from_temp(models_root, args.ontologies)
     ground_truth_file = output_dir / "ground_truth.tsv"
     write_ground_truth(labels, ground_truth_file)
-
-    graphs = load_graphs(ontology_path, ia_file_path)
-
-    for idx, ontology in enumerate(args.ontologies):
-        if ontology not in graphs:
-            print(f"{Fore.YELLOW}Skipping unknown ontology {ontology}{Style.RESET_ALL}")
-            continue
-        print(
-            f"{Fore.CYAN}Running inference for ontology {ontology.upper()} using {args.checkpoint_name}{Style.RESET_ALL}"
-        )
-        nn_cfg = config["gcn"][ontology]
-        mode = "w" if idx == 0 else "a"
-        run_inference_for_ontology(
-            ontology,
-            config,
-            nn_cfg,
-            graphs[ontology],
-            models_root,
-            helpers_path,
-            temporal_path,
-            positional_index,
-            ordered_ids,
-            args.checkpoint_name,
-            args.batch_size,
-            args.num_workers,
-            predictions_file,
-            mode,
-            args.topk,
-            args.tau,
-        )
 
     results = run_cafa_evaluation(
         ontology_path,
