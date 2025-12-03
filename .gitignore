@@ -1,4 +1,5 @@
 # solution artifacts
+.vscode
 embeds/
 helpers/
 /models/

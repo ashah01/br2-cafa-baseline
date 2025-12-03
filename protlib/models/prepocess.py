@@ -6,37 +6,101 @@ import pandas as pd
 
 from ..metric import get_funcs_mapper
 
+ORGANISM_MAP = {
+    "Homo sapiens (Human)": 9606,
+    "Arabidopsis thaliana (Mouse-ear cress)": 3702,
+    "Mus musculus (Mouse)": 10090,
+    "Danio rerio (Zebrafish) (Brachydanio rerio)": 7955,
+    "Drosophila melanogaster (Fruit fly)": 7227,
+    "Rattus norvegicus (Rat)": 10116,
+    "Caenorhabditis elegans": 6239,
+    "Dictyostelium discoideum (Social amoeba)": 44689,
+    "Oryza sativa subsp. japonica (Rice)": 39947,
+    "Gallus gallus (Chicken)": 9031,
+    "Bos taurus (Bovine)": 9913,
+    "Xenopus laevis (African clawed frog)": 8355,
+    "Sus scrofa (Pig)": 9823,
+    "Zea mays (Maize)": 4577,
+    "Canis lupus familiaris (Dog) (Canis familiaris)": 9615,
+    "Pseudomonas aeruginosa": 287,
+    "Xenopus tropicalis (Western clawed frog) (Silurana tropicalis)": 8364,
+}
+
 
 def get_tax(fasta):
     tax_list = [
-        9606, 3702, 10090, 7955, 7227, 10116, 559292, 6239,
-        284812, 83333, 83332, 44689, 237561, 39947, 9031, 36329,
-        9913, 227321, 8355, 9823, 224308, 330879, 4577, 170187,
-        9615, 99287, 85962, 243232, 287, 235443, 8364
+        9606,
+        3702,
+        10090,
+        7955,
+        7227,
+        10116,
+        559292,
+        6239,
+        284812,
+        83333,
+        83332,
+        44689,
+        237561,
+        39947,
+        9031,
+        36329,
+        9913,
+        227321,
+        8355,
+        9823,
+        224308,
+        330879,
+        4577,
+        170187,
+        9615,
+        99287,
+        85962,
+        243232,
+        287,
+        235443,
+        8364,
     ]
 
-    tax = fasta['taxonomyID'].map(
-        {x: n for (n, x) in enumerate(tax_list, 1)}
-    ).fillna(0).astype(np.int32).values[:, np.newaxis]
+    if not isinstance(
+        fasta.iloc[0]["taxonomyID"], np.int64
+    ):  # kaggle train format has type np.int64
+        fasta["taxonomyID"] = (
+            fasta["taxonomyID"]
+            .map({k: v for k, v in ORGANISM_MAP.items()})
+            .fillna(0)
+            .astype(int)
+        )
+
+    tax = (
+        fasta["taxonomyID"]
+        .map({x: n for (n, x) in enumerate(tax_list, 1)})
+        .fillna(0)
+        .astype(np.int32)
+        .values[:, np.newaxis]
+    )
     tax = tax == np.arange(len(tax_list) + 1)[np.newaxis, :]
     tax = tax.astype(np.float32)
 
     return tax
 
 
-def get_sergey_embeds(fasta, path, ):
+def get_sergey_embeds(
+    fasta,
+    path,
+):
     embed = np.load(path).astype(np.float32)
 
     dirname, basename = os.path.dirname(path), os.path.basename(path)
-    id_name = os.path.join(dirname, basename.replace('_embeds', '_ids'))
+    id_name = os.path.join(dirname, basename.replace("_embeds", "_ids"))
 
     idx = np.load(id_name)
 
-    if (len(idx) == len(fasta)) and (np.asarray(idx) == fasta['EntryID'].values).all():
+    if (len(idx) == len(fasta)) and (np.asarray(idx) == fasta["EntryID"].values).all():
         return embed
 
     idx = pd.Series(np.arange(idx.shape[0]), index=idx)
-    idx = idx[fasta['EntryID'].values]
+    idx = idx[fasta["EntryID"].values]
 
     return embed[idx]
 
@@ -44,12 +108,16 @@ def get_sergey_embeds(fasta, path, ):
 def get_features_simple(fasta, embeds_list):
     fasta = pd.read_feather(fasta)
     tax = get_tax(fasta)
-    embeds = np.concatenate([get_sergey_embeds(fasta, x) for x in embeds_list] + [tax], axis=1)
+    embeds = np.concatenate(
+        [get_sergey_embeds(fasta, x) for x in embeds_list] + [tax], axis=1
+    )
 
-    return embeds, fasta['EntryID'].values
+    return embeds, fasta["EntryID"].values
 
 
-def get_targets_from_parquet(path, ontologies, split, ids=None, names=None, fillna=False):
+def get_targets_from_parquet(
+    path, ontologies, split, ids=None, names=None, fillna=False
+):
     res = []
 
     for i in range(3):
@@ -62,19 +130,19 @@ def get_targets_from_parquet(path, ontologies, split, ids=None, names=None, fill
         stop = start + split[i]
 
         if ids is not None:
-            names_ = get_funcs_mapper(G, False)[ids[start: stop]].tolist()
+            names_ = get_funcs_mapper(G, False)[ids[start:stop]].tolist()
         elif names is not None:
-            names_ = list(names[start: stop])
+            names_ = list(names[start:stop])
         else:
             raise ValueError()
 
-        flist = sorted(glob.glob(os.path.join(path, G.namespace, 'part*')))
-        trg = pd.concat([
-            pd.read_parquet(x, columns=names_) for x in flist
-        ], ignore_index=True)  # pd.read_parquet(flist, columns=names_)
+        flist = sorted(glob.glob(os.path.join(path, G.namespace, "part*")))
+        trg = pd.concat(
+            [pd.read_parquet(x, columns=names_) for x in flist], ignore_index=True
+        )  # pd.read_parquet(flist, columns=names_)
 
         if fillna:
-            print('trg filled')
+            print("trg filled")
             trg = trg.fillna(0)
 
         res.append(trg.values)
